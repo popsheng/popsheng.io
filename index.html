@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html>
+
+  <head>
+    <meta charset='utf-8'>
+    <meta http-equiv="X-UA-Compatible" content="chrome=1">
+    <meta name="description" content="Popsheng.io : MapReduce过程、Spark和Hadoop以Shuffle为中心的对比分析">
+
+    <link rel="stylesheet" type="text/css" media="screen" href="stylesheets/stylesheet.css">
+
+    <title>Popsheng.io</title>
+  </head>
+
+  <body>
+
+    <!-- HEADER -->
+    <div id="header_wrap" class="outer">
+        <header class="inner">
+          <a id="forkme_banner" href="https://github.com/popsheng/popsheng.io">View on GitHub</a>
+
+          <h1 id="project_title">Popsheng.io</h1>
+          <h2 id="project_tagline">MapReduce过程、Spark和Hadoop以Shuffle为中心的对比分析</h2>
+
+            <section id="downloads">
+              <a class="zip_download_link" href="https://github.com/popsheng/popsheng.io/zipball/master">Download this project as a .zip file</a>
+              <a class="tar_download_link" href="https://github.com/popsheng/popsheng.io/tarball/master">Download this project as a tar.gz file</a>
+            </section>
+        </header>
+    </div>
+
+    <!-- MAIN CONTENT -->
+    <div id="main_content_wrap" class="outer">
+      <section id="main_content" class="inner">
+        <h2>
+<a id="mapreduce与spark的map-shuffle-reduce过程" class="anchor" href="#mapreduce%E4%B8%8Espark%E7%9A%84map-shuffle-reduce%E8%BF%87%E7%A8%8B" aria-hidden="true"><span class="octicon octicon-link"></span></a>mapreduce与Spark的map-Shuffle-reduce过程</h2>
+
+<ul>
+<li>
+<p><strong>mapreduce过程解析（mapreduce采用的是sort-based shuffle）</strong></p>
+
+<ul>
+<li>将获取到的数据分片partition进行解析，获得k/v对，之后交由map()进行处理.</li>
+<li>map函数处理完成之后，进入collect阶段，对处理后的k/v对进行收集，存储在内存的环形缓冲区中。</li>
+<li>当环形缓冲区中的数据达到阀值之后<strong>（也可能一直没有达到阀值，也一样要将内存中的数据写入磁盘）</strong>，将内存缓冲区中的数据通过SpillThread线程转移到磁盘上。需要注意的是，转移之前，首先利用快排对记录数据进行排序（原则是先按照分区编号，再按照key进行排序，<strong>注意，排序是在写入磁盘之前的</strong>）。之后按照partition编号，获取上述排序之后的数据并将其写入Spill.out文件中（一个Spill.out文件中可能会有<strong>多个分区</strong>的数据--因为一次map操作会有多次的spill的过程），需要注意的是，<strong>如果人为设置了combiner，在写入文件之前</strong>，需要对每个分区中的数据进行聚集操作。该文件同时又对应SpillRecord结构（Spill.out文件索引）。</li>
+<li>map的最后一个阶段是merge：该过程会将<strong>每一个Spill.out文件合并成为一个大文件</strong>（该文件也有对应的索引文件），合并的过程很简单，就是将多个Spill.out文件的在同一个partition的数据进行合并。<strong>（第一次聚合）</strong>
+***</li>
+<li>shuffle阶段。首先要说明的是shuffle阶段有两种阀值设置。第一，获取来自map的结果数据的时候，根据数据大小（file.out的大小）自然划分到内存或者是磁盘（<strong>这种阀值的设置跟map阶段完全不同</strong>）；第二，内存和磁盘能够保存的文件数目有阀值，超出阀值，会对文件进行merge操作，即小文件合并成为大文件。Shuffle过程：<br>
+1）获取完成的Map Task列表。<br>
+2）进行数据的远程拷贝（http get的方法），根据数据文件的大小自然划分到内存或者是磁盘。<br>
+3）当内存或者磁盘的文件较多时，进行文件合并。<strong>（第二次聚合）</strong>
+***</li>
+<li>reduce之前需要进行Sort操作，但是两个阶段是<strong>并行化的</strong>，Sort在内存或者磁盘中建立小顶堆，并保存了指向该小顶堆根节点的迭代器，同时Reduce Task通过迭代器将key相同的数据顺次讲给reduce()函数进行处理。</li>
+</ul>
+</li>
+<li>
+<p><strong>Spark Shuffle过程解析（采用hash-based shuffle）</strong></p>
+
+<ul>
+<li>RDD是Spark与Hadoop之间最明显的差别（数据结构），Spark中的RDD具有很多特性，在这里就不再赘述。</li>
+<li>Spark与Hadoop之间的Shuffle过程大致类似，Spark的Shuffle的前后也各有一次聚合操作。但是也有很明显的差别：Hadoop的shuffle过程是明显的几个阶段：map()，spill，merge，shuffle，sort，reduce()等，是按照流程顺次执行的，属于push类型；但是，Spark不一样，因为Spark的Shuffle过程是算子驱动的，具有懒执行的特点，属于pull类型。</li>
+<li>Spark与Hadoop的Shuffle之间第二个明显的差别是，Spark的Shuffle是hash-based类型的，而Hadoop的Shuffle是sort-based类型的。下面简介一下Spark的Shuffle：<br>
+1.正因为是算子驱动的，Spark的Shuffle主要是两个阶段：Shuffle Write和Shuffle Read。<br>
+2.<strong>ShuffleMapTask的整个的执行过程就是Shuffle Write阶段</strong><br>
+3.Sprk的Shuffle过程刚开始的操作就是将map的结果文件中的数据记录送到对应的bucket里面（缓冲区），分到哪一个bucket根据key来决定（<strong>该过程是hash的过程，每一个bucket都对应最终的reducer，也就是说在hash-based下，数据会自动划分到对应reducer的bucket里面</strong>）。之后，每个bucket里面的数据会不断被写到本地磁盘上，形成一个ShuffleBlockFile，或者简称FileSegment。<strong>上述就是整个ShuffleMapTask过程</strong>。之后，reducer会去fetch属于自己的FileSegment，进入shuffle read阶段。<br>
+4.需要注意的是reducer进行数据的fetch操作是等到所有的ShuffleMapTask执行完才开始进行的，因为所有的ShuffleMapTask可能不在同一个stage里面，而stage执行后提交是要在父stage执行提交之后才能进行的，所以fetch操作并不是FileSegment产生就执行的。<br>
+5.需要注意的是，刚fetch来的FileSegment存放在softBuffer缓冲区，Spark规定这个缓冲界限不能超过spark.reducer.maxMbInFlight，这里用softBuffer表示，默认大小48MB。<br>
+6.经过reduce处理后的数据放在内存+磁盘上（采用相关策略进行spill）。<br>
+7.fetch一旦开始，就会边fetch边处理（reduce）。MapReduce shuffle阶段就是边fetch边使用combine()进行处理，但是combine()处理的是部分数据。MapReduce不能做到边fetch边reduce处理，因为MapReduce为了让进入reduce()的records有序，必须等到全部数据都shuffle-sort后再开始reduce()。然而，Spark不要求shuffle后的数据全局有序，因此没必要等到全部数据shuffle完成后再处理。为了实现边shuffle边处理，而且流入的records是无序的可以用aggregate的数据结构，比如HashMap。<br>
+</li>
+</ul>
+</li>
+</ul>
+
+<hr>
+
+<ul>
+<li>
+<p><strong>hash-based 和 sort-based的对比</strong></p>
+
+<ul>
+<li>
+<p>hash-based故名思义也就是在Shuffle的过程中写数据时不做排序操作，只是将数据根据Hash的结果，将各个Reduce分区的数据写到各自的磁盘文件中。这样带来的问题就是如果Reduce分区的数量比较大的话，将会产生大量的磁盘文件（Map*Reduce）。如果文件数量特别巨大，对文件读写的性能会带来比较大的影响，此外由于同时打开的文件句柄数量众多，序列化，以及压缩等操作需要分配的临时内存空间也可能会迅速膨胀到无法接受的地步，对内存的使用和GC带来很大的压力，在Executor内存比较小的情况下尤为突出，例如Spark on Yarn模式。但是这种方式也是有改善的方法的：  </p>
+
+<blockquote>
+<p>在一个core上连续执行的ShuffleMapTasks可以共用一个输出文件ShuffleFile。先执行完的ShuffleMapTask形成ShuffleBlock i，后执行的ShuffleMapTask可以将输出数据直接追加到ShuffleBlock i后面，形成ShuffleBlock i’，每个ShuffleBlock被称为FileSegment。下一个stage的reducer只需要fetch整个ShuffleFile就行了。这样的话，整个shuffle文件的数目就变为C*R了。</p>
+</blockquote>
+</li>
+<li><p>sort-based是Spark1.1版本之后实现的一个试验性（也就是一些功能和接口还在开发演变中）的ShuffleManager，它在写入分区数据的时候，首先会根据实际情况对数据采用不同的方式进行排序操作，底线是至少按照Reduce分区Partition进行排序，这样来至于同一个Map任务Shuffle到不同的Reduce分区中去的所有数据都可以写入到同一个外部磁盘文件中去，用简单的Offset标志不同Reduce分区的数据在这个文件中的偏移量。这样一个Map任务就只需要生成一个shuffle文件，从而避免了上述HashShuffleManager可能遇到的文件数量巨大的问题。上述过程与mapreduce的过程类似。</p></li>
+</ul>
+</li>
+<li>
+<p>两者的性能比较，取决于内存，排序，文件操作等因素的综合影响。  </p>
+
+<blockquote>
+<ul>
+<li>对于不需要进行排序的Shuffle操作来说，如repartition等，如果文件数量不是特别巨大，HashShuffleManager面临的内存问题不大，而SortShuffleManager需要额外的根据Partition进行排序，显然HashShuffleManager的效率会更高。<br>
+</li>
+<li>而对于本来就需要在Map端进行排序的Shuffle操作来说，如ReduceByKey等，使用HashShuffleManager虽然在写数据时不排序，但在其它的步骤中仍然需要排序，而SortShuffleManager则可以将写数据和排序两个工作合并在一起执行，因此即使不考虑HashShuffleManager的内存使用问题，SortShuffleManager依旧可能更快。</li>
+</ul>
+</blockquote>
+</li>
+</ul>
+      </section>
+    </div>
+
+    <!-- FOOTER  -->
+    <div id="footer_wrap" class="outer">
+      <footer class="inner">
+        <p class="copyright">Popsheng.io maintained by <a href="https://github.com/popsheng">popsheng</a></p>
+        <p>Published with <a href="https://pages.github.com">GitHub Pages</a></p>
+      </footer>
+    </div>
+
+    
+
+  </body>
+</html>
